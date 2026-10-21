@@ -1,15 +1,27 @@
 """Generate a log-log price band analysis chart from customer pricing data.
 
-The script reads a CSV or Excel file containing customer name, procedure
-quantity, and procedure price columns.  It standardizes the input columns,
-fits a trend line in log-log space, overlays one- and two-standard-deviation
-bands, displays the scatter plot on logarithmic axes, and exports the full
-analysis table to a formatted Excel file.
+The script reads a CSV or Excel file containing a customer (or customer
+group) column, a procedure quantity column, and a procedure price column.
+It then:
+
+  1. Standardizes the input columns (see ``COLUMN_ALIASES``).
+  2. Aggregates rows that share the same customer/group name into a single
+     record: quantities are summed and prices are quantity-weighted
+     (configurable via ``CONFIG["aggregate_by_customer"]`` or
+     ``--no-aggregate``).
+  3. Applies the minimum-quantity and price thresholds to the aggregated
+     records.
+  4. Fits a trend line in log-log space, classifies each record against
+     one- and two-standard-deviation bands, and runs within-bin and
+     percentile-based outlier checks.
+  5. Displays the scatter plot on logarithmic axes and exports the full
+     analysis table to a formatted Excel file.
 
 Usage:
     python price_band_analysis.py
     python price_band_analysis.py input_file.csv
     python price_band_analysis.py input_file.xlsx --sheet "Sheet1"
+    python price_band_analysis.py input_file.xlsx --no-aggregate
 
 Dependencies:
     pandas, numpy, matplotlib, openpyxl (for .xlsx input/output)
@@ -41,9 +53,15 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Accepted aliases for each required input column (order = match priority).
+# Accepted aliases for each required input column, in match-priority order.
+# Matching is case-insensitive and treats underscores as spaces (see
+# ``normalize_column_name``), so "customer_name" and "Customer Name" are the
+# same alias.  "group or customer" is listed first so that, when a file
+# carries both a working "Customer" column and a "Group or Customer" column,
+# the group-level column is used.
 COLUMN_ALIASES: dict[str, list[str]] = {
     "customer_name": [
+        "group or customer",
         "customer name",
         "customer group",
         "customer group l3",
@@ -51,7 +69,6 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "customer",
         "account",
         "account name",
-        "customer_name",
         "name",
     ],
     "procedure_quantity": [
@@ -61,16 +78,15 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "procedure qty",
         "qty",
         "volume",
-        "procedure_quantity",
     ],
     "procedure_price": [
         "procedure price",
+        "procedure asp",
         "price",
         "unit price",
         "avg price",
-        "procedure_price",
         "net procedure price",
-        "net price"
+        "net price",
     ],
 }
 
@@ -81,6 +97,23 @@ STANDARD_COLUMN_NAMES: dict[str, str] = {
     "procedure_price": "Procedure Price",
 }
 
+# Number of source rows combined into each analysed record (1 for every
+# record when aggregation is disabled).
+RECORDS_AGGREGATED_COL = "Records Aggregated"
+
+# Placeholder used for blank / missing customer names.  Rows carrying this
+# placeholder are never aggregated together, because they are not known to
+# belong to the same customer.
+UNKNOWN_CUSTOMER = "Unknown"
+
+# Severity labels in the order they should appear in the Excel export
+# (most severe first).
+SEVERITY_ORDER: list[str] = [
+    "High Concern Outlier",
+    "Lower Concern Outlier",
+    "Normal",
+]
+
 # Approximate plot-area dimensions (in typographic points) for a (12, 8)-inch
 # figure.  Used solely to convert pixel offsets into proportional log-space
 # distances for label-collision scoring.  Exact values are not critical; they
@@ -89,16 +122,21 @@ _PLOT_WIDTH_PTS: float = 650.0
 _PLOT_HEIGHT_PTS: float = 450.0
 
 CONFIG: dict = {
-    # Data-filtering thresholds
+    # Aggregation: when True, rows sharing the same customer/group name are
+    # combined (quantity summed, price quantity-weighted) BEFORE the
+    # thresholds below are applied.
+    "aggregate_by_customer": True,
+    # Data-filtering thresholds (applied to aggregated records)
     "min_procedure_units": 10,
     "max_procedure_price": 8000,
     # Bin configuration for within-bin outlier analysis
     "max_procedure_unit_bins": 4,
     "min_records_per_bin": 5,
-    # When True, Pricing Position is left blank for points within 1 SD
+    # When True, Pricing Position is left blank for points within 1 SD;
+    # when False, those points are labelled "In Line".
     "band_blank_within_1sd_pricing_position": True,
     # Points beyond this many SDs from the trend line receive scatter labels
-    "scatter_label_sd_threshold": 1.0,
+    "scatter_label_sd_threshold": 1.8,
     # Within-bin outlier-detection parameters
     "robust_zscore_threshold": 3.5,
     "robust_iqr_multiplier": 1.5,
@@ -115,12 +153,27 @@ CONFIG: dict = {
         "High Concern Outlier": "F8CBAD",
     },
     # Percentile-based outlier flag thresholds (0-100 scale).
-    # Customers at or below the low threshold on BOTH procedure units and
+    # Records at or below the low threshold on BOTH procedure units and
     # procedure price are flagged as "Outlier - Low Price and Volume".
-    # Customers at or above the high threshold on both are flagged as
+    # Records at or above the high threshold on both are flagged as
     # "Outlier - High Price and Volume".
     "outlier_low_percentile_threshold": 30,
     "outlier_high_percentile_threshold": 70,
+}
+
+# Excel number formats applied to output columns, keyed by column header.
+EXCEL_NUMBER_FORMATS: dict[str, str] = {
+    **dict.fromkeys(
+        [
+            "Procedure Price", "Trend Price", "Bin Median Price",
+            "Bin IQR Lower Bound", "Bin IQR Upper Bound",
+            "Bin Lower Percentile Threshold", "Bin Upper Percentile Threshold",
+        ],
+        "$#,##0.00",
+    ),
+    **dict.fromkeys(["Residual Ratio", "Bin Percentile Rank"], "0.0000"),
+    **dict.fromkeys(["Log Residual", "Bin Robust Z Score", "SD From Trend"], "0.000"),
+    **dict.fromkeys(["Procedure Units Percentile", "Procedure Price Percentile"], "0.0"),
 }
 
 
@@ -129,18 +182,19 @@ CONFIG: dict = {
 # ---------------------------------------------------------------------------
 
 def normalize_column_name(column_name: str) -> str:
-    """Collapse whitespace, strip, and lowercase a column name for matching."""
+    """Lowercase, strip, convert underscores to spaces, and collapse whitespace."""
     return " ".join(str(column_name).strip().lower().replace("_", " ").split())
 
 
 def find_matching_column(columns: pd.Index, aliases: list[str]) -> str:
     """Return the first column whose normalized name matches an alias.
 
+    Aliases are tried in list order, so earlier aliases take priority when a
+    file contains several candidate columns.
+
     Raises ``KeyError`` if no alias matches any column in *columns*.
     """
-    normalized_map = {
-        normalize_column_name(col): col for col in columns
-    }
+    normalized_map = {normalize_column_name(col): col for col in columns}
     for alias in aliases:
         normalized_alias = normalize_column_name(alias)
         if normalized_alias in normalized_map:
@@ -154,7 +208,8 @@ def find_matching_column(columns: pd.Index, aliases: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _show_tk_message(title: str, message: str, *, level: str = "info") -> None:
-    """Display a message via a tkinter dialog, falling back to the console.
+    """Display a message via a tkinter dialog, falling back to the console
+    when tkinter or a display is unavailable.
 
     Parameters
     ----------
@@ -167,19 +222,26 @@ def _show_tk_message(title: str, message: str, *, level: str = "info") -> None:
         warnings (stderr).
     """
     if messagebox and tk:
-        root = tk.Tk()
-        root.withdraw()
         try:
-            dialog_fn = (
-                messagebox.showwarning if level == "warning"
-                else messagebox.showinfo
-            )
-            dialog_fn(title, message)
-        finally:
-            root.destroy()
-    else:
-        stream = sys.stderr if level == "warning" else sys.stdout
-        print(f"{title}: {message}", file=stream)
+            root = tk.Tk()
+        except tk.TclError:
+            # tkinter is installed but no display is available (e.g. a
+            # headless server); fall through to console output.
+            pass
+        else:
+            root.withdraw()
+            try:
+                dialog_fn = (
+                    messagebox.showwarning if level == "warning"
+                    else messagebox.showinfo
+                )
+                dialog_fn(title, message)
+            finally:
+                root.destroy()
+            return
+
+    stream = sys.stderr if level == "warning" else sys.stdout
+    print(f"{title}: {message}", file=stream)
 
 
 def show_info_message(title: str, message: str) -> None:
@@ -196,13 +258,18 @@ def show_warning_message(title: str, message: str) -> None:
 # File-dialog helpers
 # ---------------------------------------------------------------------------
 
-def choose_input_file() -> Path:
-    """Open a file-selection dialog and return the chosen input path."""
+def _require_tk(purpose: str) -> None:
+    """Raise a helpful error when tkinter dialogs are unavailable."""
     if not tk or not filedialog:
         raise RuntimeError(
-            "File dialog is not available in this Python environment. "
-            "Please provide the input file as a command-line argument."
+            f"{purpose} dialog is not available in this Python environment. "
+            "Please provide the file as a command-line argument."
         )
+
+
+def choose_input_file() -> Path:
+    """Open a file-selection dialog and return the chosen input path."""
+    _require_tk("File")
 
     root = tk.Tk()
     root.withdraw()
@@ -228,11 +295,7 @@ def choose_input_file() -> Path:
 
 def choose_output_file(default_name: str) -> Path:
     """Open a save-as dialog and return the chosen Excel output path."""
-    if not tk or not filedialog:
-        raise RuntimeError(
-            "Save dialog is not available in this Python environment. "
-            "Please provide the output file as a command-line argument."
-        )
+    _require_tk("Save")
 
     root = tk.Tk()
     root.withdraw()
@@ -280,14 +343,12 @@ def load_excel_sheet(
     }
 
     for candidate_df in workbook.values():
-        sheet_columns = {
-            normalize_column_name(c) for c in candidate_df.columns
-        }
+        sheet_columns = {normalize_column_name(c) for c in candidate_df.columns}
         if quantity_aliases & sheet_columns:
             return candidate_df
 
     # No sheet explicitly matched -- fall back to the first sheet.
-    return workbook[next(iter(workbook))]
+    return next(iter(workbook.values()))
 
 
 def load_input_file(
@@ -305,83 +366,144 @@ def load_input_file(
 
 
 # ---------------------------------------------------------------------------
-# Data cleaning & standardization
+# Data cleaning, aggregation & standardization
 # ---------------------------------------------------------------------------
 
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map source column names to the standard analysis column names."""
-    mapped = {
-        key: find_matching_column(df.columns, aliases)
-        for key, aliases in COLUMN_ALIASES.items()
-    }
-
-    out = df[
-        [mapped["customer_name"], mapped["procedure_quantity"], mapped["procedure_price"]]
-    ].copy()
-    out.columns = [
-        STANDARD_COLUMN_NAMES["customer_name"],
-        STANDARD_COLUMN_NAMES["procedure_quantity"],
-        STANDARD_COLUMN_NAMES["procedure_price"],
+    """Select the three analysis columns and rename them to standard names."""
+    source_columns = [
+        find_matching_column(df.columns, COLUMN_ALIASES[key])
+        for key in STANDARD_COLUMN_NAMES
     ]
+    out = df[source_columns].copy()
+    out.columns = list(STANDARD_COLUMN_NAMES.values())
     return out
 
 
-def clean_input_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize, validate, and filter the raw input for analysis.
+def normalize_customer_names(names: pd.Series) -> pd.Series:
+    """Strip whitespace and replace blank / missing names with a placeholder.
 
-    Steps:
-      1. Map source columns to standard names.
-      2. Coerce quantity and price to numeric (non-numeric becomes NaN).
-      3. Drop rows with NaN quantity/price, quantities below the configured
-         minimum, non-positive prices, and prices above the configured max.
-      4. Notify the user of any dropped rows.
+    Missing values are filled *before* string conversion: with pandas' string
+    dtype, ``astype(str)`` keeps NaN as a missing value rather than the text
+    ``"nan"``, and missing keys would otherwise be silently dropped by
+    ``groupby`` during aggregation.
     """
-    cleaned = standardize_columns(df)
+    cleaned = names.fillna("").astype(str).str.strip()
+    return cleaned.mask(cleaned.isin(["", "nan", "None"]), UNKNOWN_CUSTOMER)
+
+
+def aggregate_by_customer(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse rows sharing the same customer/group name into one record.
+
+    * Procedure Quantity  -> sum of quantities
+    * Procedure Price     -> quantity-weighted average price,
+                             ``sum(qty * price) / sum(qty)``
+    * Records Aggregated  -> number of source rows combined
+
+    The weighted average assumes each input price is a per-procedure average
+    for that row.  If a group's total quantity is not positive its price is
+    set to NaN, so the record is removed by the threshold filter.
+
+    Rows named ``UNKNOWN_CUSTOMER`` are passed through individually rather
+    than being merged into one artificial group.
+    """
     customer_col = STANDARD_COLUMN_NAMES["customer_name"]
     quantity_col = STANDARD_COLUMN_NAMES["procedure_quantity"]
     price_col = STANDARD_COLUMN_NAMES["procedure_price"]
 
-    # Normalize customer names; replace blanks with a placeholder.
-    cleaned[customer_col] = cleaned[customer_col].astype(str).str.strip()
-    cleaned.loc[
-        cleaned[customer_col].isin(["", "nan", "None"]),
-        customer_col,
-    ] = "Unknown"
+    unknown_mask = df[customer_col] == UNKNOWN_CUSTOMER
+    known = df.loc[~unknown_mask]
 
-    # Coerce to numeric and count rows that had non-numeric values.
+    grouped = (
+        known.assign(_extended=known[quantity_col] * known[price_col])
+        .groupby(customer_col, sort=False, as_index=False)
+        .agg(**{
+            quantity_col: (quantity_col, "sum"),
+            "_extended": ("_extended", "sum"),
+            RECORDS_AGGREGATED_COL: (price_col, "size"),
+        })
+    )
+    total_qty = grouped[quantity_col]
+    grouped[price_col] = grouped["_extended"] / total_qty.where(total_qty > 0)
+    grouped = grouped.drop(columns="_extended")
+
+    unknown = df.loc[unknown_mask].assign(**{RECORDS_AGGREGATED_COL: 1})
+
+    columns = [customer_col, quantity_col, price_col, RECORDS_AGGREGATED_COL]
+    return pd.concat([grouped[columns], unknown[columns]], ignore_index=True)
+
+
+def clean_input_data(df: pd.DataFrame, *, aggregate: bool = True) -> pd.DataFrame:
+    """Standardize, aggregate, validate, and filter the raw input for analysis.
+
+    Steps:
+      1. Map source columns to standard names and normalize customer names.
+      2. Coerce quantity and price to numeric and drop rows where either is
+         non-numeric or missing.
+      3. When *aggregate* is True, combine rows sharing the same customer /
+         group name (see ``aggregate_by_customer``).  This happens before
+         thresholds so that small member accounts count toward their group.
+      4. Keep records with quantity >= ``min_procedure_units`` and
+         0 < price <= ``max_procedure_price``.
+      5. Report what was dropped / combined.
+    """
+    customer_col = STANDARD_COLUMN_NAMES["customer_name"]
+    quantity_col = STANDARD_COLUMN_NAMES["procedure_quantity"]
+    price_col = STANDARD_COLUMN_NAMES["procedure_price"]
+
+    cleaned = standardize_columns(df)
+    input_rows = len(cleaned)
+    cleaned[customer_col] = normalize_customer_names(cleaned[customer_col])
+
+    # -- Remove non-numeric rows -------------------------------------------
     cleaned[quantity_col] = pd.to_numeric(cleaned[quantity_col], errors="coerce")
     cleaned[price_col] = pd.to_numeric(cleaned[price_col], errors="coerce")
+    numeric_mask = cleaned[quantity_col].notna() & cleaned[price_col].notna()
+    non_numeric_count = int((~numeric_mask).sum())
+    cleaned = cleaned.loc[numeric_mask]
 
-    non_numeric_mask = cleaned[quantity_col].isna() | cleaned[price_col].isna()
-    non_numeric_count = int(non_numeric_mask.sum())
+    # -- Aggregate to one record per customer / group ----------------------
+    if aggregate:
+        cleaned = aggregate_by_customer(cleaned)
+    else:
+        # Keep the column in the export even when rows are analysed
+        # individually, so the output layout is always the same.
+        cleaned = cleaned.assign(**{RECORDS_AGGREGATED_COL: 1})
+    record_count = len(cleaned)
 
-    # Apply all row-level filters in a single pass to avoid repeated copies.
-    # NaN comparisons evaluate to False, so non-numeric rows are excluded
-    # implicitly by the range conditions.
+    # -- Apply thresholds --------------------------------------------------
+    # NaN prices (e.g. groups with non-positive total quantity) fail these
+    # comparisons and are therefore excluded as well.
     valid_mask = (
-        ~non_numeric_mask
-        & (cleaned[quantity_col] >= CONFIG["min_procedure_units"])
+        (cleaned[quantity_col] >= CONFIG["min_procedure_units"])
         & (cleaned[price_col] > 0)
         & (cleaned[price_col] <= CONFIG["max_procedure_price"])
     )
-    cleaned = cleaned.loc[valid_mask].copy()
+    cleaned = cleaned.loc[valid_mask].reset_index(drop=True)
+    threshold_drop_count = record_count - len(cleaned)
+
+    # -- Reporting ---------------------------------------------------------
+    summary_lines = [f"Input rows: {input_rows}"]
+    if non_numeric_count:
+        summary_lines.append(f"Rows dropped (non-numeric values): {non_numeric_count}")
+    if aggregate:
+        summary_lines.append(f"Customers / groups after aggregation: {record_count}")
+    summary_lines.append(
+        f"Records dropped by thresholds (quantity < {CONFIG['min_procedure_units']} "
+        f"or price outside 0-{CONFIG['max_procedure_price']}): {threshold_drop_count}"
+    )
+    summary_lines.append(f"Records analysed: {len(cleaned)}")
+    summary = "\n".join(summary_lines)
 
     if cleaned.empty:
-        message = (
-            "No valid data remains after cleaning and filtering.  "
-            f"Records must have Procedure Quantity >= {CONFIG['min_procedure_units']} "
-            f"and Procedure Price <= {CONFIG['max_procedure_price']}."
-        )
-        if non_numeric_count > 0:
-            message += f"\n\nRows with non-numeric values: {non_numeric_count}"
-        show_warning_message("No Valid Data", message)
+        show_warning_message("No Valid Data", f"No valid data remains.\n\n{summary}")
         raise ValueError("No valid rows found after cleaning input data.")
 
-    if non_numeric_count > 0:
-        show_info_message(
-            "Data Cleaning Complete",
-            f"Loaded successfully.\nRows dropped (non-numeric values): {non_numeric_count}",
-        )
+    if non_numeric_count:
+        # Surface data-quality issues prominently (dialog when available).
+        show_info_message("Data Cleaning Complete", summary)
+    else:
+        print(summary)
 
     return cleaned
 
@@ -390,37 +512,28 @@ def clean_input_data(df: pd.DataFrame) -> pd.DataFrame:
 # Trend fitting
 # ---------------------------------------------------------------------------
 
-def fit_log_log_trend(
-    df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def fit_log_log_trend(df: pd.DataFrame) -> tuple[np.ndarray, float]:
     """Fit a linear regression in log10-log10 space.
 
     Returns
     -------
-    x_values : ndarray
-        Raw procedure quantities.
-    y_values : ndarray
-        Raw procedure prices.
     trend_values : ndarray
-        Predicted prices on the original (non-log) scale.
+        Predicted prices on the original (non-log) scale, one per row of *df*.
     residual_std : float
-        Standard deviation of log10 residuals (ddof=1).
+        Standard deviation of log10 residuals (ddof=1); 0.0 when there are
+        too few points to estimate it.
     """
-    quantity_col = STANDARD_COLUMN_NAMES["procedure_quantity"]
-    price_col = STANDARD_COLUMN_NAMES["procedure_price"]
-
-    x = df[quantity_col].to_numpy(dtype=float)
-    y = df[price_col].to_numpy(dtype=float)
-
     if len(df) < 2:
         raise ValueError("At least two rows are required to fit a trend line.")
 
-    log_x, log_y = np.log10(x), np.log10(y)
+    log_x = np.log10(df[STANDARD_COLUMN_NAMES["procedure_quantity"]].to_numpy(dtype=float))
+    log_y = np.log10(df[STANDARD_COLUMN_NAMES["procedure_price"]].to_numpy(dtype=float))
+
     slope, intercept = np.polyfit(log_x, log_y, 1)
     trend_log = slope * log_x + intercept
     residual_std = float(np.std(log_y - trend_log, ddof=1)) if len(df) > 2 else 0.0
 
-    return x, y, np.power(10.0, trend_log), residual_std
+    return np.power(10.0, trend_log), residual_std
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +545,9 @@ def build_procedure_unit_bins(
 ) -> tuple[pd.Series, pd.DataFrame]:
     """Assign each row to a quantile-based procedure-unit bin.
 
+    Rows are ranked first (ties broken by order) so that ``qcut`` always
+    produces equal-count bins even when many quantities are identical.
+
     Returns
     -------
     bin_labels : Series
@@ -440,23 +556,14 @@ def build_procedure_unit_bins(
         Two columns -- *Procedure Unit Bin* and *Procedure Unit Bin Range*
         (human-readable min-to-max string).
     """
-    bin_count = min(CONFIG["max_procedure_unit_bins"], max(len(quantity_series), 1))
+    bin_count = min(CONFIG["max_procedure_unit_bins"], len(quantity_series))
 
     if bin_count <= 1:
-        bin_labels = pd.Series(
-            ["Bin 1"] * len(quantity_series),
-            index=quantity_series.index,
-        )
+        bin_labels = pd.Series("Bin 1", index=quantity_series.index)
     else:
         rank_values = quantity_series.rank(method="first")
-        raw_bins = pd.qcut(rank_values, q=bin_count, labels=False, duplicates="drop")
-        if raw_bins is None:
-            bin_labels = pd.Series(
-                ["Bin 1"] * len(quantity_series),
-                index=quantity_series.index,
-            )
-        else:
-            bin_labels = raw_bins.astype(int).add(1).map(lambda v: f"Bin {v}")
+        bin_numbers = pd.qcut(rank_values, q=bin_count, labels=False)
+        bin_labels = bin_numbers.astype(int).add(1).map(lambda v: f"Bin {v}")
 
     bin_summary = (
         pd.DataFrame({
@@ -498,17 +605,18 @@ def calculate_robust_z_scores(series: pd.Series) -> pd.Series:
 def append_bin_outlier_metrics(analysis_df: pd.DataFrame) -> pd.DataFrame:
     """Add procedure-unit bin labels and per-bin outlier diagnostics.
 
-    Three independent methods flag outliers within each bin:
+    Three independent methods flag price outliers within each bin:
 
     1. **Robust Z-score** -- modified Z-score exceeding the configured
        threshold (``robust_zscore_threshold``).
     2. **Robust IQR** -- price outside ``Q1 - k*IQR ... Q3 + k*IQR``
        (``robust_iqr_multiplier``).
-    3. **Percentile extremes** -- rank below ``percentile_lower`` or above
-       ``percentile_upper``.
+    3. **Percentile extremes** -- percentile rank at or below
+       ``percentile_lower`` or at or above ``percentile_upper``.
 
     Bins with fewer than ``min_records_per_bin`` peers suppress all outlier
-    flags to avoid false positives from small samples.
+    flags to avoid false positives from small samples (descriptive
+    statistics are still reported).
     """
     price_col = STANDARD_COLUMN_NAMES["procedure_price"]
     quantity_col = STANDARD_COLUMN_NAMES["procedure_quantity"]
@@ -518,8 +626,8 @@ def append_bin_outlier_metrics(analysis_df: pd.DataFrame) -> pd.DataFrame:
     enriched["Procedure Unit Bin"] = bin_labels
     enriched = enriched.merge(bin_summary, on="Procedure Unit Bin", how="left")
 
-    # Pre-initialize metric columns with safe defaults so every row has a
-    # value even if its bin is skipped or too small for detection.
+    # Pre-initialize metric columns so that dtypes are set up front and every
+    # row has a value; each bin's rows are overwritten in the loop below.
     enriched["Bin Peer Count"] = 0
     enriched["Bin Median Price"] = np.nan
     enriched["Bin Robust Z Score"] = 0.0
@@ -535,7 +643,7 @@ def append_bin_outlier_metrics(analysis_df: pd.DataFrame) -> pd.DataFrame:
     enriched["Bin Outlier Flag"] = False
     enriched["Bin Outlier Methods"] = ""
 
-    for _, bin_idx in enriched.groupby("Procedure Unit Bin").groups.items():
+    for bin_idx in enriched.groupby("Procedure Unit Bin").groups.values():
         prices = enriched.loc[bin_idx, price_col]
         peer_count = len(prices)
 
@@ -546,44 +654,31 @@ def append_bin_outlier_metrics(analysis_df: pd.DataFrame) -> pd.DataFrame:
         upper_bound = q3 + CONFIG["robust_iqr_multiplier"] * iqr
         robust_z = calculate_robust_z_scores(prices)
         pct_ranks = prices.rank(method="average", pct=True)
-        lower_thresh = prices.quantile(CONFIG["percentile_lower"])
-        upper_thresh = prices.quantile(CONFIG["percentile_upper"])
 
         # -- Outlier masks for each method ---------------------------------
-        z_outlier = robust_z.abs() > CONFIG["robust_zscore_threshold"]
-        iqr_outlier = (prices < lower_bound) | (prices > upper_bound)
-        pct_outlier = (
-            (pct_ranks <= CONFIG["percentile_lower"])
-            | (pct_ranks >= CONFIG["percentile_upper"])
-        )
-
-        # Suppress all flags when the bin is too small for reliable detection.
         if peer_count < CONFIG["min_records_per_bin"]:
-            z_outlier = pd.Series(False, index=prices.index)
-            iqr_outlier = pd.Series(False, index=prices.index)
-            pct_outlier = pd.Series(False, index=prices.index)
+            # Too few peers for reliable detection: suppress all flags.
+            z_outlier = iqr_outlier = pct_outlier = pd.Series(False, index=prices.index)
+        else:
+            z_outlier = robust_z.abs() > CONFIG["robust_zscore_threshold"]
+            iqr_outlier = (prices < lower_bound) | (prices > upper_bound)
+            pct_outlier = (
+                (pct_ranks <= CONFIG["percentile_lower"])
+                | (pct_ranks >= CONFIG["percentile_upper"])
+            )
 
         methods_triggered = (
-            z_outlier.astype(int)
-            + iqr_outlier.astype(int)
-            + pct_outlier.astype(int)
+            z_outlier.astype(int) + iqr_outlier.astype(int) + pct_outlier.astype(int)
         )
 
-        # Build a human-readable comma-separated list of which methods fired.
-        method_labels = pd.DataFrame({
-            "robust_z": z_outlier,
-            "robust_iqr": iqr_outlier,
-            "percentile_extreme": pct_outlier,
-        }).apply(
-            lambda row: ", ".join(
-                name
-                for name, flag in [
-                    ("Robust Z score", row["robust_z"]),
-                    ("Robust IQR", row["robust_iqr"]),
-                    ("Percentile extremes", row["percentile_extreme"]),
-                ]
-                if flag
-            ),
+        # Human-readable comma-separated list of which methods fired.
+        method_flags = pd.DataFrame({
+            "Robust Z score": z_outlier,
+            "Robust IQR": iqr_outlier,
+            "Percentile extremes": pct_outlier,
+        })
+        method_labels = method_flags.apply(
+            lambda row: ", ".join(row.index[row.to_numpy(dtype=bool)]),
             axis=1,
         )
 
@@ -596,8 +691,12 @@ def append_bin_outlier_metrics(analysis_df: pd.DataFrame) -> pd.DataFrame:
         enriched.loc[bin_idx, "Bin IQR Upper Bound"] = upper_bound
         enriched.loc[bin_idx, "Bin Robust IQR Outlier"] = iqr_outlier
         enriched.loc[bin_idx, "Bin Percentile Rank"] = pct_ranks
-        enriched.loc[bin_idx, "Bin Lower Percentile Threshold"] = lower_thresh
-        enriched.loc[bin_idx, "Bin Upper Percentile Threshold"] = upper_thresh
+        enriched.loc[bin_idx, "Bin Lower Percentile Threshold"] = prices.quantile(
+            CONFIG["percentile_lower"]
+        )
+        enriched.loc[bin_idx, "Bin Upper Percentile Threshold"] = prices.quantile(
+            CONFIG["percentile_upper"]
+        )
         enriched.loc[bin_idx, "Bin Percentile Extreme"] = pct_outlier
         enriched.loc[bin_idx, "Bin Outlier Methods Triggered"] = methods_triggered
         enriched.loc[bin_idx, "Bin Outlier Flag"] = methods_triggered > 0
@@ -613,7 +712,7 @@ def append_percentile_outlier_flags(df: pd.DataFrame) -> pd.DataFrame:
     PERCENTRANK.INC convention (0 for the minimum value, 100 for the
     maximum).  Results are rounded to one decimal place.
 
-    The outlier flag marks customers as:
+    The outlier flag marks records as:
 
     * ``"Outlier - Low Price and Volume"`` when both the units percentile
       and the price percentile are at or below
@@ -627,18 +726,13 @@ def append_percentile_outlier_flags(df: pd.DataFrame) -> pd.DataFrame:
     enriched = df.copy()
     n = len(enriched)
 
-    if n > 1:
-        qty_rank = enriched[quantity_col].rank(method="min")
-        price_rank = enriched[price_col].rank(method="min")
-        enriched["Procedure Units Percentile"] = (
-            (qty_rank - 1) / (n - 1) * 100
-        ).round(1)
-        enriched["Procedure Price Percentile"] = (
-            (price_rank - 1) / (n - 1) * 100
-        ).round(1)
-    else:
-        enriched["Procedure Units Percentile"] = 0.0
-        enriched["Procedure Price Percentile"] = 0.0
+    def percent_rank(series: pd.Series) -> pd.Series:
+        if n <= 1:
+            return pd.Series(0.0, index=series.index)
+        return ((series.rank(method="min") - 1) / (n - 1) * 100).round(1)
+
+    enriched["Procedure Units Percentile"] = percent_rank(enriched[quantity_col])
+    enriched["Procedure Price Percentile"] = percent_rank(enriched[price_col])
 
     low_thresh = CONFIG["outlier_low_percentile_threshold"]
     high_thresh = CONFIG["outlier_high_percentile_threshold"]
@@ -668,15 +762,19 @@ def classify_outliers(
     trend_values: np.ndarray,
     residual_std: float,
 ) -> pd.DataFrame:
-    """Classify each record by its deviation from the log-log trend.
+    """Build the full analysis table from the cleaned data and trend fit.
 
-    Band assignment:
+    Trend-band classification (by absolute log10 residual):
       * **Within 1 SD** -- Normal
       * **Between 1 and 2 SD** -- Lower Concern Outlier
       * **Outside 2 SD** -- High Concern Outlier
 
     ``Pricing Position`` (``"Potentially Underpriced"`` /
     ``"Potentially Overpriced"``) is assigned only to points outside 1 SD.
+
+    The result is then enriched with within-bin outlier metrics
+    (``append_bin_outlier_metrics``) and dataset-wide percentile flags
+    (``append_percentile_outlier_flags``).
     """
     price_col = STANDARD_COLUMN_NAMES["procedure_price"]
 
@@ -684,40 +782,34 @@ def classify_outliers(
     out["Trend Price"] = trend_values
     out["Log Residual"] = np.log10(out[price_col]) - np.log10(out["Trend Price"])
     out["Residual Ratio"] = out[price_col] / out["Trend Price"]
-    # Signed distance from the trend line, expressed in standard deviations of
-    # the log10 residuals.  Positive = above the trend (higher price than
-    # predicted), negative = below the trend.  The magnitude of this value is
-    # what drives the 1 SD / 2 SD band assignment below.
-    if residual_std != 0:
-        out["SD From Trend"] = out["Log Residual"] / residual_std
-    else:
-        out["SD From Trend"] = 0.0
+    # Signed distance from the trend line in standard deviations of the log10
+    # residuals: positive = priced above trend, negative = below trend.
+    out["SD From Trend"] = (
+        out["Log Residual"] / residual_std if residual_std != 0 else 0.0
+    )
     out["Band"] = "Within 1 SD"
     out["Severity"] = "Normal"
-    out["Pricing Position"] = ""
+    out["Pricing Position"] = (
+        "" if CONFIG["band_blank_within_1sd_pricing_position"] else "In Line"
+    )
 
     if residual_std != 0:
         abs_resid = out["Log Residual"].abs()
-        between_mask = (abs_resid > residual_std) & (abs_resid <= 2 * residual_std)
-        beyond_mask = abs_resid > 2 * residual_std
+        outside_1sd = abs_resid > residual_std
+        beyond_2sd = abs_resid > 2 * residual_std
+        between_mask = outside_1sd & ~beyond_2sd
 
         out.loc[between_mask, "Band"] = "Between 1 and 2 SD"
-        out.loc[beyond_mask, "Band"] = "Outside 2 SD"
+        out.loc[beyond_2sd, "Band"] = "Outside 2 SD"
         out.loc[between_mask, "Severity"] = "Lower Concern Outlier"
-        out.loc[beyond_mask, "Severity"] = "High Concern Outlier"
+        out.loc[beyond_2sd, "Severity"] = "High Concern Outlier"
 
-        outside_1sd = abs_resid > residual_std
-        out.loc[
-            outside_1sd & (out[price_col] < out["Trend Price"]),
-            "Pricing Position",
-        ] = "Potentially Underpriced"
-        out.loc[
-            outside_1sd & (out[price_col] > out["Trend Price"]),
-            "Pricing Position",
-        ] = "Potentially Overpriced"
-
-    if not CONFIG["band_blank_within_1sd_pricing_position"]:
-        out.loc[out["Band"] == "Within 1 SD", "Pricing Position"] = "In Line"
+        out.loc[outside_1sd & (out["Log Residual"] < 0), "Pricing Position"] = (
+            "Potentially Underpriced"
+        )
+        out.loc[outside_1sd & (out["Log Residual"] > 0), "Pricing Position"] = (
+            "Potentially Overpriced"
+        )
 
     return append_percentile_outlier_flags(append_bin_outlier_metrics(out))
 
@@ -734,7 +826,7 @@ def get_band_lines(
 
     In log-space, adding/subtracting a constant is equivalent to multiplying/
     dividing in linear space, so the bands are symmetric on the log-scale
-    chart.
+    chart.  Returns an empty dict when *residual_std* is zero.
     """
     if residual_std == 0:
         return {}
@@ -756,15 +848,13 @@ def get_band_lines(
 def _generate_candidate_offsets(
     num_angles: int = 12,
     radii: tuple[float, ...] = (14.0, 24.0, 36.0),
-) -> list[tuple[float, float]]:
+) -> np.ndarray:
     """Generate candidate label offsets arranged in concentric rings.
 
-    Returns a list of ``(dx, dy)`` pairs in display-point units.  Each ring
-    places *num_angles* evenly-spaced directions at the given radius, giving
-    ``num_angles * len(radii)`` total candidates (default: 36).  Successive
-    rings are offset by half an angular step so that inner and outer
-    candidates do not share the same radial line, improving coverage in
-    dense clusters.
+    Returns an ``(num_angles * len(radii), 2)`` array of ``(dx, dy)`` pairs
+    in display-point units (default: 36 candidates).  Successive rings are
+    rotated by half an angular step so that inner and outer candidates do
+    not share the same radial line, improving coverage in dense clusters.
 
     Parameters
     ----------
@@ -775,12 +865,11 @@ def _generate_candidate_offsets(
     """
     offsets: list[tuple[float, float]] = []
     for ring_idx, radius in enumerate(radii):
-        # Stagger alternate rings by half a step for better coverage.
         phase = (ring_idx * np.pi) / num_angles
         for i in range(num_angles):
             angle = phase + 2.0 * np.pi * i / num_angles
             offsets.append((radius * np.cos(angle), radius * np.sin(angle)))
-    return offsets
+    return np.asarray(offsets)
 
 
 def _select_best_offset(
@@ -858,7 +947,7 @@ def annotate_outliers(
     labeled_points_df: pd.DataFrame,
     label_color: str = "#d62728",
 ) -> None:
-    """Annotate outlier points with customer names, minimizing label overlap.
+    """Annotate outlier points with customer/group names, minimizing overlap.
 
     Labels are placed in priority order (largest absolute log-residual first)
     so that the most extreme outliers get first pick of the best positions.
@@ -871,24 +960,19 @@ def annotate_outliers(
     price_col = STANDARD_COLUMN_NAMES["procedure_price"]
     customer_col = STANDARD_COLUMN_NAMES["customer_name"]
 
-    # Compute axis spans in log-space for offset-to-log conversion.
-    x_vals = plot_df[quantity_col].to_numpy(dtype=float)
-    y_vals = plot_df[price_col].to_numpy(dtype=float)
-    x_log_span = max(np.log10(x_vals.max()) - np.log10(x_vals.min()), 1e-6)
-    y_log_span = max(np.log10(y_vals.max()) - np.log10(y_vals.min()), 1e-6)
+    # All data-point positions in log-space as an (N, 2) array so the
+    # scoring function can vectorise distance calculations.
+    data_points_log = np.log10(
+        plot_df[[quantity_col, price_col]].to_numpy(dtype=float)
+    )
+    x_log_span, y_log_span = np.maximum(np.ptp(data_points_log, axis=0), 1e-6)
 
-    # Pre-compute all data-point positions in log-space as an (N, 2) array
-    # so the scoring function can vectorise distance calculations.
-    data_points_log = np.column_stack([np.log10(x_vals), np.log10(y_vals)])
+    candidate_offsets = _generate_candidate_offsets()
 
-    # Generate candidate offsets once and convert to an ndarray for NumPy ops.
-    candidate_offsets = np.asarray(_generate_candidate_offsets())
-
-    # Track where labels have been placed (in log-space) so that later
-    # labels can steer away from earlier ones.
+    # Log-space positions of labels placed so far, so that later labels can
+    # steer away from earlier ones.
     placed_labels: list[tuple[float, float]] = []
 
-    # Sort so the most extreme outliers (highest |residual|) are placed first.
     prioritized = labeled_points_df.sort_values(
         "Log Residual",
         ascending=False,
@@ -911,10 +995,10 @@ def annotate_outliers(
             candidate_offsets,
         )
 
-        # Record the chosen label position for future collision checks.
-        label_lx = anchor_lx + (offset[0] / _PLOT_WIDTH_PTS) * x_log_span
-        label_ly = anchor_ly + (offset[1] / _PLOT_HEIGHT_PTS) * y_log_span
-        placed_labels.append((label_lx, label_ly))
+        placed_labels.append((
+            anchor_lx + (offset[0] / _PLOT_WIDTH_PTS) * x_log_span,
+            anchor_ly + (offset[1] / _PLOT_HEIGHT_PTS) * y_log_span,
+        ))
 
         ax.annotate(
             row[customer_col],
@@ -948,48 +1032,41 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
     price_col = STANDARD_COLUMN_NAMES["procedure_price"]
 
     # -- Trend fitting & outlier classification ----------------------------
-    _, _, trend_values, residual_std = fit_log_log_trend(df)
+    trend_values, residual_std = fit_log_log_trend(df)
     analysis_df = classify_outliers(df, trend_values, residual_std)
     plot_df = analysis_df.sort_values(quantity_col).reset_index(drop=True)
 
     x_sorted = plot_df[quantity_col].to_numpy(dtype=float)
     trend_sorted = plot_df["Trend Price"].to_numpy(dtype=float)
 
-    # -- Split points by band for colour-coded scatter ---------------------
-    normal_df = plot_df.loc[plot_df["Band"] == "Within 1 SD"]
-    lower_concern_df = plot_df.loc[plot_df["Band"] == "Between 1 and 2 SD"]
-    outliers_df = plot_df.loc[plot_df["Band"] == "Outside 2 SD"]
-
-    # Determine which points will receive customer-name labels.
-    label_thresh = float(CONFIG["scatter_label_sd_threshold"])
-    labeled_df = (
-        plot_df.loc[plot_df["Log Residual"].abs() > label_thresh * residual_std]
-        if residual_std != 0
-        else plot_df.iloc[0:0]
-    ).copy()
+    # Points beyond the configured SD threshold receive name labels.
+    if residual_std != 0:
+        label_thresh = float(CONFIG["scatter_label_sd_threshold"])
+        labeled_df = plot_df.loc[
+            plot_df["Log Residual"].abs() > label_thresh * residual_std
+        ]
+    else:
+        labeled_df = plot_df.iloc[0:0]
 
     # -- Render the chart --------------------------------------------------
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    # Scatter: normal points
-    ax.scatter(
-        normal_df[quantity_col], normal_df[price_col],
-        alpha=0.75, s=60, label="Within 1 SD", color="#1f77b4",
-    )
-    # Scatter: lower-concern outliers
-    if not lower_concern_df.empty:
-        ax.scatter(
-            lower_concern_df[quantity_col], lower_concern_df[price_col],
-            alpha=0.85, s=75, label="Between 1 and 2 SD",
-            color="#ff7f0e", edgecolors="black", linewidths=0.5,
-        )
-    # Scatter: high-concern outliers
-    if not outliers_df.empty:
-        ax.scatter(
-            outliers_df[quantity_col], outliers_df[price_col],
-            alpha=0.95, s=90, label="Outside 2 SD",
-            color="#d62728", edgecolors="black",
-        )
+    # Colour-coded scatter, one series per band (empty bands are skipped so
+    # they do not appear in the legend).
+    scatter_styles = {
+        "Within 1 SD": {"alpha": 0.75, "s": 60, "color": "#1f77b4"},
+        "Between 1 and 2 SD": {
+            "alpha": 0.85, "s": 75, "color": "#ff7f0e",
+            "edgecolors": "black", "linewidths": 0.5,
+        },
+        "Outside 2 SD": {
+            "alpha": 0.95, "s": 90, "color": "#d62728", "edgecolors": "black",
+        },
+    }
+    for band, style in scatter_styles.items():
+        band_df = plot_df.loc[plot_df["Band"] == band]
+        if not band_df.empty:
+            ax.scatter(band_df[quantity_col], band_df[price_col], label=band, **style)
 
     # Trend line
     ax.plot(
@@ -997,9 +1074,8 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
         color="black", linewidth=2.2, label="Log-log trend line",
     )
 
-    # Standard-deviation band lines (+/-1 SD and +/-2 SD).
-    # Only the upper line of each pair carries a legend label; the lower line
-    # is drawn without one to avoid duplicate legend entries.
+    # Standard-deviation band lines (+/-1 SD and +/-2 SD).  Only the upper
+    # line of each pair carries a legend label to avoid duplicate entries.
     bands = get_band_lines(trend_sorted, residual_std)
     if bands:
         ax.plot(x_sorted, bands["+1 SD"], "--", color="#ff7f0e", lw=1.8, label="+/- 1 SD")
@@ -1010,7 +1086,6 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
     ax.set_xscale("log")
     ax.set_yscale("log")
 
-    # Annotate outlier points with customer names.
     if not labeled_df.empty:
         annotate_outliers(ax, plot_df, labeled_df)
 
@@ -1030,13 +1105,46 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
 # Excel export
 # ---------------------------------------------------------------------------
 
+def _move_after(columns: list[str], to_move: list[str], anchor: str) -> list[str]:
+    """Return *columns* with *to_move* (those present) placed directly after
+    *anchor*, in the order given.  Unchanged if *anchor* is absent."""
+    if anchor not in columns:
+        return columns
+    moving = [c for c in to_move if c in columns and c != anchor]
+    remaining = [c for c in columns if c not in moving]
+    pos = remaining.index(anchor) + 1
+    return remaining[:pos] + moving + remaining[pos:]
+
+
+def order_export_columns(columns: list[str]) -> list[str]:
+    """Apply the Excel export column order.
+
+    * Records Aggregated directly after Customer Name.
+    * Procedure Units Percentile, Procedure Price Percentile and Outlier Flag
+      directly after Pricing Position.
+    """
+    columns = _move_after(
+        columns,
+        [RECORDS_AGGREGATED_COL],
+        STANDARD_COLUMN_NAMES["customer_name"],
+    )
+    columns = _move_after(
+        columns,
+        ["Procedure Units Percentile", "Procedure Price Percentile", "Outlier Flag"],
+        "Pricing Position",
+    )
+    return columns
+
+
 def save_outliers(analysis_df: pd.DataFrame, output_path: Path) -> None:
     """Save the analysis table to a formatted Excel workbook.
 
-    Applies colour-coded severity fills, number formatting for currency /
-    ratio / decimal columns, frozen header row, auto-filter, and auto-fit
-    column widths.
+    Rows are sorted most-severe first, then by bin, number of within-bin
+    methods triggered, quantity, and price.  Applies colour-coded severity
+    fills, number formats (``EXCEL_NUMBER_FORMATS``), a styled and frozen
+    header row, auto-filter, and auto-fit column widths.
     """
+    severity_rank = {sev: i for i, sev in enumerate(SEVERITY_ORDER)}
     export_df = analysis_df.sort_values(
         [
             "Severity",
@@ -1046,7 +1154,9 @@ def save_outliers(analysis_df: pd.DataFrame, output_path: Path) -> None:
             "Procedure Price",
         ],
         ascending=[True, True, False, True, False],
+        key=lambda col: col.map(severity_rank) if col.name == "Severity" else col,
     )
+    export_df = export_df[order_export_columns(list(export_df.columns))]
     export_df.to_excel(
         output_path,
         index=False,
@@ -1073,63 +1183,31 @@ def save_outliers(analysis_df: pd.DataFrame, output_path: Path) -> None:
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
-    # -- Severity row fills ------------------------------------------------
+    # -- Body formatting (number formats and severity row fills) -----------
     severity_fills = {
         sev: PatternFill(fill_type="solid", start_color=c, end_color=c)
         for sev, c in CONFIG["severity_fill_colors"].items()
     }
-
-    # Map header names to 1-based column indices for fast lookup.
-    header_map = {
-        cell.value: cell.column for cell in ws[1] if cell.value is not None
-    }
-    severity_col_idx = header_map.get("Severity")
-
-    # -- Cell-level formatting (number formats and row fills) --------------
-    # Note: openpyxl requires per-cell iteration; for very large exports this
-    # loop dominates runtime but there is no faster built-in alternative.
-    currency_cols = {
-        "Procedure Price", "Trend Price", "Bin Median Price",
-        "Bin IQR Lower Bound", "Bin IQR Upper Bound",
-        "Bin Lower Percentile Threshold", "Bin Upper Percentile Threshold",
-    }
-    ratio_cols = {"Residual Ratio", "Bin Percentile Rank"}
-    decimal_cols = {
-        "Log Residual", "Bin Robust Z Score",
-        "SD From Trend",
-    }
-    percentile_cols = {"Procedure Units Percentile", "Procedure Price Percentile"}
+    headers = list(export_df.columns)
+    severity_pos = headers.index("Severity")
+    # Resolve each column's number format once rather than per cell.
+    column_formats = [EXCEL_NUMBER_FORMATS.get(name) for name in headers]
 
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        sev_value = (
-            row[severity_col_idx - 1].value
-            if severity_col_idx is not None
-            else None
-        )
-        row_fill = severity_fills.get(sev_value)
-
-        for cell in row:
-            col_name = ws.cell(row=1, column=cell.column).value
-            if col_name in currency_cols:
-                cell.number_format = "$#,##0.00"
-            elif col_name in ratio_cols:
-                cell.number_format = "0.0000"
-            elif col_name in decimal_cols:
-                cell.number_format = "0.000"
-            elif col_name in percentile_cols:
-                cell.number_format = "0.0"
-
+        row_fill = severity_fills.get(row[severity_pos].value)
+        for cell, number_format in zip(row, column_formats):
+            if number_format:
+                cell.number_format = number_format
             if row_fill is not None:
                 cell.fill = row_fill
 
     # -- Auto-fit column widths (capped at 40 characters) ------------------
-    for col_idx in range(1, ws.max_column + 1):
-        col_letter = get_column_letter(col_idx)
+    for col_idx, column_cells in enumerate(ws.iter_cols(), start=1):
         max_len = max(
             len(str(cell.value)) if cell.value is not None else 0
-            for cell in ws[col_letter]
+            for cell in column_cells
         )
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
 
     workbook.save(output_path)
 
@@ -1166,6 +1244,14 @@ def parse_args() -> argparse.Namespace:
         default="Procedure Price Band Analysis",
         help="Chart title.",
     )
+    parser.add_argument(
+        "--no-aggregate",
+        dest="aggregate",
+        action="store_false",
+        default=CONFIG["aggregate_by_customer"],
+        help="Analyse each input row separately instead of aggregating rows "
+             "that share the same customer/group name.",
+    )
     return parser.parse_args()
 
 
@@ -1177,7 +1263,7 @@ def main() -> int:
         input_path = Path(args.input_file) if args.input_file else choose_input_file()
 
         raw_df = load_input_file(input_path, args.sheet)
-        cleaned_df = clean_input_data(raw_df)
+        cleaned_df = clean_input_data(raw_df, aggregate=args.aggregate)
         analysis_df = plot_analysis(cleaned_df, args.title)
 
         output_path = (
@@ -1191,9 +1277,9 @@ def main() -> int:
         bin_outliers = int(analysis_df["Bin Outlier Flag"].sum())
         print("Analysis complete.  Chart displayed on screen.")
         print(f"Output file saved to: {output_path}")
-        print(f"Rows analyzed: {len(analysis_df)}")
+        print(f"Records analysed: {len(analysis_df)}")
         print(f"High concern outliers (>2 SD from trend): {high_concern}")
-        print(f"Customers flagged by at least one within-bin method: {bin_outliers}")
+        print(f"Records flagged by at least one within-bin method: {bin_outliers}")
         return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
