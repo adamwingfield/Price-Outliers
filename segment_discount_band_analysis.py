@@ -513,7 +513,7 @@ def _suggest_matches(missing: list, available: list) -> str:
 # ═══════════════════════════════════════════════════════════════════
 # EXCLUSION FILTERS – add values to exclude matching rows
 # ═══════════════════════════════════════════════════════════════════
-EXCLUDE_BUSINESS_PARTNER  = []
+EXCLUDE_BUSINESS_PARTNER  = ["NHS SUPPLY CHAIN (0000127423)", "NATIONAL DISTRIBUTION CENTRE (0000136577)", "SPIRE NDC (0000123497)"]
 EXCLUDE_MATERIAL_GROUP    = ["SERVICE - SERVICE"]
 EXCLUDE_PRODUCT_GROUP     = []
 EXCLUDE_MARKET_SEGMENT    = []
