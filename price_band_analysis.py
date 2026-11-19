@@ -12,7 +12,7 @@ It then:
   3. Applies the minimum-quantity and price thresholds to the aggregated
      records.
   4. Fits a trend line in log-log space, classifies each record against
-     one- and two-standard-deviation bands, and runs within-bin and
+     one-, two- and three-standard-deviation bands, and runs within-bin and
      percentile-based outlier checks.
   5. Displays the scatter plot on logarithmic axes and exports the full
      analysis table to a formatted Excel file.
@@ -109,6 +109,7 @@ UNKNOWN_CUSTOMER = "Unknown"
 # Severity labels in the order they should appear in the Excel export
 # (most severe first).
 SEVERITY_ORDER: list[str] = [
+    "Extreme Concern Outlier",
     "High Concern Outlier",
     "Lower Concern Outlier",
     "Normal",
@@ -136,7 +137,7 @@ CONFIG: dict = {
     # when False, those points are labelled "In Line".
     "band_blank_within_1sd_pricing_position": True,
     # Points beyond this many SDs from the trend line receive scatter labels
-    "scatter_label_sd_threshold": 1.8,
+    "scatter_label_sd_threshold": 1.4,
     # Within-bin outlier-detection parameters
     "robust_zscore_threshold": 3.5,
     "robust_iqr_multiplier": 1.5,
@@ -151,6 +152,7 @@ CONFIG: dict = {
         "Normal": "DDEBF7",
         "Lower Concern Outlier": "FCE4D6",
         "High Concern Outlier": "F8CBAD",
+        "Extreme Concern Outlier": "FF8B8B",
     },
     # Percentile-based outlier flag thresholds (0-100 scale).
     # Records at or below the low threshold on BOTH procedure units and
@@ -160,6 +162,27 @@ CONFIG: dict = {
     "outlier_low_percentile_threshold": 30,
     "outlier_high_percentile_threshold": 70,
 }
+
+# Left-most columns of the Excel export, in display order.  Any column not
+# listed here is placed to the right of these (see ``order_export_columns``).
+LEADING_EXPORT_COLUMNS: list[str] = [
+    "Customer Name",
+    "Procedure Quantity",
+    "Procedure Price",
+    "SD From Trend",
+    "Band",
+    "Severity",
+    "Pricing Position",
+    "Procedure Units Percentile",
+    "Procedure Price Percentile",
+]
+
+# Columns placed immediately after ``LEADING_EXPORT_COLUMNS``, in this order.
+# All remaining columns then follow in their original calculation order.
+SECONDARY_EXPORT_COLUMNS: list[str] = [
+    "Outlier Flag",
+    RECORDS_AGGREGATED_COL,
+]
 
 # Excel number formats applied to output columns, keyed by column header.
 EXCEL_NUMBER_FORMATS: dict[str, str] = {
@@ -767,7 +790,8 @@ def classify_outliers(
     Trend-band classification (by absolute log10 residual):
       * **Within 1 SD** -- Normal
       * **Between 1 and 2 SD** -- Lower Concern Outlier
-      * **Outside 2 SD** -- High Concern Outlier
+      * **Between 2 and 3 SD** -- High Concern Outlier
+      * **Outside 3 SD** -- Extreme Concern Outlier
 
     ``Pricing Position`` (``"Potentially Underpriced"`` /
     ``"Potentially Overpriced"``) is assigned only to points outside 1 SD.
@@ -797,12 +821,16 @@ def classify_outliers(
         abs_resid = out["Log Residual"].abs()
         outside_1sd = abs_resid > residual_std
         beyond_2sd = abs_resid > 2 * residual_std
-        between_mask = outside_1sd & ~beyond_2sd
+        beyond_3sd = abs_resid > 3 * residual_std
+        between_1_2 = outside_1sd & ~beyond_2sd
+        between_2_3 = beyond_2sd & ~beyond_3sd
 
-        out.loc[between_mask, "Band"] = "Between 1 and 2 SD"
-        out.loc[beyond_2sd, "Band"] = "Outside 2 SD"
-        out.loc[between_mask, "Severity"] = "Lower Concern Outlier"
-        out.loc[beyond_2sd, "Severity"] = "High Concern Outlier"
+        out.loc[between_1_2, "Band"] = "Between 1 and 2 SD"
+        out.loc[between_2_3, "Band"] = "Between 2 and 3 SD"
+        out.loc[beyond_3sd, "Band"] = "Outside 3 SD"
+        out.loc[between_1_2, "Severity"] = "Lower Concern Outlier"
+        out.loc[between_2_3, "Severity"] = "High Concern Outlier"
+        out.loc[beyond_3sd, "Severity"] = "Extreme Concern Outlier"
 
         out.loc[outside_1sd & (out["Log Residual"] < 0), "Pricing Position"] = (
             "Potentially Underpriced"
@@ -822,7 +850,7 @@ def get_band_lines(
     trend_values: np.ndarray,
     residual_std: float,
 ) -> dict[str, np.ndarray]:
-    """Return multiplicative +/-1 SD and +/-2 SD band lines.
+    """Return multiplicative +/-1 SD, +/-2 SD and +/-3 SD band lines.
 
     In log-space, adding/subtracting a constant is equivalent to multiplying/
     dividing in linear space, so the bands are symmetric on the log-scale
@@ -833,11 +861,14 @@ def get_band_lines(
 
     f1 = np.power(10.0, residual_std)
     f2 = np.power(10.0, 2 * residual_std)
+    f3 = np.power(10.0, 3 * residual_std)
     return {
         "+1 SD": trend_values * f1,
         "-1 SD": trend_values / f1,
         "+2 SD": trend_values * f2,
         "-2 SD": trend_values / f2,
+        "+3 SD": trend_values * f3,
+        "-3 SD": trend_values / f3,
     }
 
 
@@ -1059,8 +1090,12 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
             "alpha": 0.85, "s": 75, "color": "#ff7f0e",
             "edgecolors": "black", "linewidths": 0.5,
         },
-        "Outside 2 SD": {
+        "Between 2 and 3 SD": {
             "alpha": 0.95, "s": 90, "color": "#d62728", "edgecolors": "black",
+        },
+        "Outside 3 SD": {
+            "alpha": 1.0, "s": 110, "color": "#7f0000", "edgecolors": "black",
+            "linewidths": 1.0,
         },
     }
     for band, style in scatter_styles.items():
@@ -1074,14 +1109,17 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
         color="black", linewidth=2.2, label="Log-log trend line",
     )
 
-    # Standard-deviation band lines (+/-1 SD and +/-2 SD).  Only the upper
+    # Standard-deviation band lines (+/-1 SD green, +/-2 SD orange,
+    # +/-3 SD red).  Only the upper
     # line of each pair carries a legend label to avoid duplicate entries.
     bands = get_band_lines(trend_sorted, residual_std)
     if bands:
-        ax.plot(x_sorted, bands["+1 SD"], "--", color="#ff7f0e", lw=1.8, label="+/- 1 SD")
-        ax.plot(x_sorted, bands["-1 SD"], "--", color="#ff7f0e", lw=1.8)
-        ax.plot(x_sorted, bands["+2 SD"], ":",  color="#2ca02c", lw=2.0, label="+/- 2 SD")
-        ax.plot(x_sorted, bands["-2 SD"], ":",  color="#2ca02c", lw=2.0)
+        ax.plot(x_sorted, bands["+1 SD"], ":", color="#2ca02c", lw=1.8, label="+/- 1 SD")
+        ax.plot(x_sorted, bands["-1 SD"], ":", color="#2ca02c", lw=1.8)
+        ax.plot(x_sorted, bands["+2 SD"], ":",  color="#ff7f0e", lw=1.8, label="+/- 2 SD")
+        ax.plot(x_sorted, bands["-2 SD"], ":",  color="#ff7f0e", lw=1.8)
+        ax.plot(x_sorted, bands["+3 SD"], ":", color="#d62728", lw=1.8, label="+/- 3 SD")
+        ax.plot(x_sorted, bands["-3 SD"], ":", color="#d62728", lw=1.8)
 
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -1105,35 +1143,26 @@ def plot_analysis(df: pd.DataFrame, chart_title: str) -> pd.DataFrame:
 # Excel export
 # ---------------------------------------------------------------------------
 
-def _move_after(columns: list[str], to_move: list[str], anchor: str) -> list[str]:
-    """Return *columns* with *to_move* (those present) placed directly after
-    *anchor*, in the order given.  Unchanged if *anchor* is absent."""
-    if anchor not in columns:
-        return columns
-    moving = [c for c in to_move if c in columns and c != anchor]
-    remaining = [c for c in columns if c not in moving]
-    pos = remaining.index(anchor) + 1
-    return remaining[:pos] + moving + remaining[pos:]
-
-
 def order_export_columns(columns: list[str]) -> list[str]:
     """Apply the Excel export column order.
 
-    * Records Aggregated directly after Customer Name.
-    * Procedure Units Percentile, Procedure Price Percentile and Outlier Flag
-      directly after Pricing Position.
+    1. ``LEADING_EXPORT_COLUMNS`` form the left-most block, in the order
+       listed (Customer Name, Procedure Quantity, Procedure Price,
+       SD From Trend, Band, Severity, Pricing Position,
+       Procedure Units Percentile, Procedure Price Percentile).
+    2. ``SECONDARY_EXPORT_COLUMNS`` follow directly after that block.
+    3. Every other column is placed to the right, keeping its original
+       calculation order.
+
+    Listed columns that are absent from *columns* are skipped, and no column
+    is ever dropped or duplicated.
     """
-    columns = _move_after(
-        columns,
-        [RECORDS_AGGREGATED_COL],
-        STANDARD_COLUMN_NAMES["customer_name"],
-    )
-    columns = _move_after(
-        columns,
-        ["Procedure Units Percentile", "Procedure Price Percentile", "Outlier Flag"],
-        "Pricing Position",
-    )
-    return columns
+    priority = [
+        c for c in dict.fromkeys(LEADING_EXPORT_COLUMNS + SECONDARY_EXPORT_COLUMNS)
+        if c in columns
+    ]
+    remaining = [c for c in columns if c not in priority]
+    return priority + remaining
 
 
 def save_outliers(analysis_df: pd.DataFrame, output_path: Path) -> None:
@@ -1273,12 +1302,14 @@ def main() -> int:
         )
         save_outliers(analysis_df, output_path)
 
-        high_concern = int((analysis_df["Band"] == "Outside 2 SD").sum())
+        extreme_concern = int((analysis_df["Band"] == "Outside 3 SD").sum())
+        high_concern = int((analysis_df["Band"] == "Between 2 and 3 SD").sum())
         bin_outliers = int(analysis_df["Bin Outlier Flag"].sum())
         print("Analysis complete.  Chart displayed on screen.")
         print(f"Output file saved to: {output_path}")
         print(f"Records analysed: {len(analysis_df)}")
-        print(f"High concern outliers (>2 SD from trend): {high_concern}")
+        print(f"Extreme concern outliers (>3 SD from trend): {extreme_concern}")
+        print(f"High concern outliers (2-3 SD from trend): {high_concern}")
         print(f"Records flagged by at least one within-bin method: {bin_outliers}")
         return 0
     except Exception as exc:
